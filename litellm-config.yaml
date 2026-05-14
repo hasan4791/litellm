@@ -1,0 +1,15 @@
+model_list:
+  # Inferencing Model (Chat)
+  - model_name: "ibm-granite/granite-3.3-8b-instruct"
+    litellm_params:
+      model: "watsonx/meta-llama/llama-3-3-70b-instruct"
+      api_key: "os.environ/WATSONX_APIKEY"
+      project_id: "os.environ/WATSONX_PROJECT_ID"
+      base_url: "os.environ/WATSONX_URL"
+litellm_settings:
+  # Hook up the translator you just built
+  callbacks: custom_callbacks.translator_instance
+general_settings:
+  pass_through_endpoints:
+    - path: "/tokenize"
+      target: http://localhost:8000/watsonx/ml/v1/text/tokenization?version=2023-05-02

@@ -103,6 +103,10 @@ async def llm_passthrough_factory_proxy_route(
     """
     from litellm.types.utils import LlmProviders
     from litellm.utils import ProviderConfigManager
+    # ADD THIS DEBUG LINE
+    print(f"[DEBUG] Looking for provider: {custom_llm_provider}")
+    print(f"[DEBUG] Provider type: {type(custom_llm_provider)}")
+    print(f"[DEBUG] LlmProviders.WATSONX value: {LlmProviders.WATSONX}")
 
     provider_config = ProviderConfigManager.get_provider_model_info(
         provider=LlmProviders(custom_llm_provider),
@@ -2368,4 +2372,168 @@ def create_generic_websocket_passthrough_endpoint(
         custom_headers=custom_headers,
         _forward_headers=forward_headers,
         cost_per_request=cost_per_request,
+    )
+
+@router.api_route(
+    "/watsonx/{endpoint:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    tags=["Watsonx Pass-through", "pass-through"],
+)
+async def watsonx_proxy_route(
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    """
+    Watsonx pass-through endpoint.
+    Allows using Watsonx APIs with automatic IAM token management and version parameter injection.
+    
+    Example:
+        POST /watsonx/ml/v1/text/tokenization
+        POST /watsonx/ml/v1/text/generation
+    """
+    from litellm.proxy.proxy_server import llm_router
+    from litellm.secret_managers.main import get_secret_str
+    
+    # Check if this is a router model request
+    if llm_router:
+        request_body = await get_request_body(request)
+        model = request_body.get("model")
+        
+        if model and is_passthrough_request_using_router_model(
+            request_body={"model": model}, llm_router=llm_router
+        ):
+            # Use router's passthrough
+            is_streaming_request = is_passthrough_request_streaming(request_body)
+            result = await llm_router.allm_passthrough_route(
+                model=model,
+                method=request.method,
+                endpoint=endpoint,
+                request_query_params=request.query_params,
+                request_headers=_safe_get_request_headers(request),
+                stream=request_body.get("stream", False),
+                content=None,
+                data=None,
+                files=None,
+                json=(
+                    request_body
+                    if request.headers.get("content-type") == "application/json"
+                    else None
+                ),
+                params=None,
+                headers=None,
+                cookies=None,
+            )
+            
+            if is_streaming_request:
+                import inspect
+                if inspect.isasyncgen(result):
+                    return StreamingResponse(
+                        content=result,
+                        status_code=200,
+                        headers={"content-type": "text/event-stream"},
+                    )
+                else:
+                    result = cast(httpx.Response, result)
+                    return StreamingResponse(
+                        content=result.aiter_bytes(),
+                        status_code=result.status_code,
+                        headers=HttpPassThroughEndpointHelpers.get_response_headers(
+                            headers=result.headers,
+                            custom_headers=None,
+                        ),
+                    )
+            
+            # Non-streaming response
+            result = cast(httpx.Response, result)
+            content = await result.aread()
+            return Response(
+                content=content,
+                status_code=result.status_code,
+                headers=HttpPassThroughEndpointHelpers.get_response_headers(
+                    headers=result.headers,
+                    custom_headers=None,
+                ),
+            )
+    
+    # Not a router model - use direct passthrough with WatsonxPassthroughConfig
+    base_target_url = (
+        get_secret_str("WATSONX_URL")
+        or get_secret_str("WATSONX_BASE_URL")
+        or "https://us-south.ml.cloud.ibm.com"
+    )
+    
+    # Get Watsonx API key
+    watsonx_api_key = passthrough_endpoint_router.get_credentials(
+        custom_llm_provider="watsonx",
+        region_name=None,
+    )
+    
+    if watsonx_api_key is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Required 'WATSONX_API_KEY' or 'WATSONX_APIKEY' in environment to make pass-through calls to Watsonx."
+        )
+    
+    # Get the passthrough config
+    from litellm.types.utils import LlmProviders
+    from litellm.utils import ProviderConfigManager
+    
+    provider_config = ProviderConfigManager.get_provider_passthrough_config(
+        provider=LlmProviders.WATSONX,
+        model="",
+    )
+    
+    if provider_config is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Watsonx passthrough config not found"
+        )
+    
+    # Get complete URL with version parameter
+    complete_url, _ = provider_config.get_complete_url(
+        api_base=base_target_url,
+        api_key=watsonx_api_key,
+        model="",
+        endpoint=endpoint,
+        request_query_params=dict(request.query_params),
+        litellm_params={},
+    )
+    
+    # Get auth headers with IAM token
+    auth_headers = provider_config.validate_environment(
+        headers={},
+        model="",
+        messages=[],
+        optional_params={},
+        litellm_params={},
+        api_key=watsonx_api_key,
+        api_base=base_target_url,
+    )
+    
+    # Check for streaming
+    is_streaming_request = False
+    if request.method == "POST":
+        if "multipart/form-data" not in request.headers.get("content-type", ""):
+            _request_body = await request.json()
+        else:
+            _request_body = await get_form_data(request)
+        
+        if _request_body.get("stream"):
+            is_streaming_request = True
+    
+    # Create pass-through endpoint
+    endpoint_func = create_pass_through_route(
+        endpoint=endpoint,
+        target=str(complete_url),
+        custom_headers=auth_headers,
+        is_streaming_request=is_streaming_request,
+        custom_llm_provider="watsonx",
+    )
+    
+    return await endpoint_func(
+        request,
+        fastapi_response,
+        user_api_key_dict,
     )
