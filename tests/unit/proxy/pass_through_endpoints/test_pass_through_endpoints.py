@@ -9130,6 +9130,100 @@ async def test_a_ui_created_pass_through_leaves_the_config_ones_open_before_the_
     assert [str(request.url) for request in ui_upstream] == ["http://ui-upstream.test/api"]
 
 
+def _request_served_by_the_proxy_app() -> MagicMock:
+    from litellm.proxy.proxy_server import app
+
+    request: Final = MagicMock(spec=Request)
+    request.app = app
+    return request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "forward_headers, path, expected_authorization",
+    [(True, "/ui-forwarding", "Bearer caller-jwt"), (None, "/ui-not-forwarding", None)],
+)
+async def test_api_created_pass_through_forwards_client_headers_only_when_forward_headers_is_set(
+    tmp_path, monkeypatch, forward_headers, path, expected_authorization
+):
+    from litellm.proxy._types import PassThroughGenericEndpoint
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import create_pass_through_endpoints
+
+    await _boot_db_backed_proxy(tmp_path, monkeypatch, config_pass_through_endpoints=[], db_pass_through_endpoints=[])
+
+    await create_pass_through_endpoints(
+        data=PassThroughGenericEndpoint(
+            path=path, target="http://ui-upstream.test/api", auth=False, forward_headers=forward_headers
+        ),
+        request=_request_served_by_the_proxy_app(),
+        user_api_key_dict=UserAPIKeyAuth(user_role="proxy_admin"),
+    )
+    response, upstream_requests = await _send_through_proxy(path, {"Authorization": "Bearer caller-jwt"})
+
+    assert response.status_code == 200
+    assert [request.headers.get("authorization") for request in upstream_requests] == [expected_authorization]
+
+
+@pytest.mark.asyncio
+async def test_db_stored_pass_through_keeps_forwarding_client_headers_after_a_db_sync(tmp_path, monkeypatch):
+    proxy: Final = await _boot_db_backed_proxy(
+        tmp_path,
+        monkeypatch,
+        config_pass_through_endpoints=[],
+        db_pass_through_endpoints=[
+            {
+                "id": "db-forwarding",
+                "path": "/db-forwarding",
+                "target": "http://db-upstream.test/api",
+                "auth": False,
+                "forward_headers": True,
+            }
+        ],
+    )
+    await _run_db_sync_cycle(proxy)
+
+    response, upstream_requests = await _send_through_proxy("/db-forwarding", {"Authorization": "Bearer caller-jwt"})
+
+    assert response.status_code == 200
+    assert [request.headers.get("authorization") for request in upstream_requests] == ["Bearer caller-jwt"]
+
+
+@pytest.mark.asyncio
+async def test_api_update_turns_on_forwarding_client_headers_for_a_db_stored_pass_through(tmp_path, monkeypatch):
+    from litellm.proxy._types import PassThroughGenericEndpoint
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import update_pass_through_endpoints
+
+    proxy: Final = await _boot_db_backed_proxy(
+        tmp_path,
+        monkeypatch,
+        config_pass_through_endpoints=[],
+        db_pass_through_endpoints=[
+            {
+                "id": "db-to-update",
+                "path": "/db-to-update",
+                "target": "http://db-upstream.test/api",
+                "auth": False,
+            }
+        ],
+    )
+    await _run_db_sync_cycle(proxy)
+    _, before_update = await _send_through_proxy("/db-to-update", {"Authorization": "Bearer caller-jwt"})
+
+    await update_pass_through_endpoints(
+        endpoint_id="db-to-update",
+        data=PassThroughGenericEndpoint(
+            path="/db-to-update", target="http://db-upstream.test/api", auth=False, forward_headers=True
+        ),
+        request=_request_served_by_the_proxy_app(),
+        user_api_key_dict=UserAPIKeyAuth(user_role="proxy_admin"),
+    )
+    await _run_db_sync_cycle(proxy)
+    _, after_update = await _send_through_proxy("/db-to-update", {"Authorization": "Bearer caller-jwt"})
+
+    assert [request.headers.get("authorization") for request in before_update] == [None]
+    assert [request.headers.get("authorization") for request in after_update] == ["Bearer caller-jwt"]
+
+
 @pytest.mark.asyncio
 async def test_config_pass_through_serves_right_after_boot(tmp_path, monkeypatch):
     await _boot_db_backed_proxy(

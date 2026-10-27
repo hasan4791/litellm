@@ -12,7 +12,6 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import pytest
 from fastapi import HTTPException, Request, Response
 
-
 import litellm
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
@@ -226,7 +225,7 @@ class TestWatsonxProxyRoute:
                 return_value=mock_provider_config,
             ),
             patch(
-                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_form_data",
+                "litellm.proxy.pass_through_endpoints.llm_provider_handlers.watsonx_passthrough_handler.get_form_data",
                 return_value=mock_form_data,
             ),
             patch(
@@ -439,6 +438,192 @@ class TestWatsonxProxyRoute:
                     == f"https://us-south.ml.cloud.ibm.com/{endpoint_path}"
                 )
 
+    @pytest.mark.asyncio
+    async def test_watsonx_proxy_route_model_restriction_denied(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.query_params = {}
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.json = AsyncMock(return_value={"model_id": "ibm/granite-13b-chat-v2", "input": "test"})
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+        mock_user_api_key_dict.models = ["openai/gpt-4o"]
+        mock_user_api_key_dict.team_models = None
+        mock_user_api_key_dict.access_group_ids = None
+        mock_user_api_key_dict.team_id = None
+        mock_user_api_key_dict.router_settings = None
+        mock_user_api_key_dict.metadata = {}
+
+        mock_provider_config = MagicMock()
+        mock_router = MagicMock()
+        mock_router.get_model_list.return_value = [
+            {
+                "model_name": "watsonx-chat",
+                "litellm_params": {
+                    "model": "watsonx/ibm/granite-13b-chat-v2",
+                    "use_in_pass_through": True,
+                    "api_key": "wx-key",
+                    "api_base": "https://us-south.ml.cloud.ibm.com",
+                },
+            }
+        ]
+
+        from litellm.proxy._types import ModelAccessDeniedProxyException
+
+        with (
+            patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.ProviderConfigManager.get_provider_passthrough_config",
+                return_value=mock_provider_config,
+            ),
+            patch("litellm.proxy.proxy_server.llm_router", mock_router),
+            patch(
+                "litellm.proxy.utils.get_available_models_for_user",
+                AsyncMock(return_value=["openai/gpt-4o"]),
+            ),
+        ):
+            with pytest.raises(ModelAccessDeniedProxyException) as exc_info:
+                await watsonx_proxy_route(
+                    endpoint="ml/v1/text/generation",
+                    request=mock_request,
+                    fastapi_response=mock_response,
+                    user_api_key_dict=mock_user_api_key_dict,
+                )
+            assert exc_info.value.code == "403"
+            assert exc_info.value.type == "key_model_access_denied"
+
+    @pytest.mark.asyncio
+    async def test_watsonx_proxy_route_model_restriction_allowed(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.query_params = {}
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.json = AsyncMock(return_value={"model_id": "ibm/granite-13b-chat-v2", "input": "test"})
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+        mock_user_api_key_dict.models = ["watsonx-chat"]
+        mock_user_api_key_dict.team_models = None
+        mock_user_api_key_dict.access_group_ids = None
+        mock_user_api_key_dict.team_id = None
+        mock_user_api_key_dict.router_settings = None
+        mock_user_api_key_dict.metadata = {}
+
+        mock_provider_config = MagicMock()
+        mock_provider_config.get_complete_url.return_value = (
+            "https://us-south.ml.cloud.ibm.com/ml/v1/text/generation",
+            {},
+        )
+        mock_provider_config.validate_environment.return_value = {"Authorization": "Bearer test-iam-token"}
+
+        mock_router = MagicMock()
+        mock_router.get_model_list.return_value = [
+            {
+                "model_name": "watsonx-chat",
+                "litellm_params": {
+                    "model": "watsonx/ibm/granite-13b-chat-v2",
+                    "use_in_pass_through": True,
+                    "api_key": "wx-key",
+                    "api_base": "https://us-south.ml.cloud.ibm.com",
+                },
+            }
+        ]
+        mock_endpoint_func = AsyncMock(return_value={"results": []})
+
+        with (
+            patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.ProviderConfigManager.get_provider_passthrough_config",
+                return_value=mock_provider_config,
+            ),
+            patch("litellm.proxy.proxy_server.llm_router", mock_router),
+            patch(
+                "litellm.proxy.utils.get_available_models_for_user",
+                AsyncMock(return_value=["watsonx-chat"]),
+            ),
+            patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
+                return_value=mock_endpoint_func,
+            ),
+        ):
+            result = await watsonx_proxy_route(
+                endpoint="ml/v1/text/generation",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+            assert result == {"results": []}
+
+    @pytest.mark.asyncio
+    async def test_watsonx_proxy_route_match_project_id_from_query_params(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "GET"
+        mock_request.query_params = {"project_id": "proj-b"}
+        mock_request.headers = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+        mock_user_api_key_dict.models = None
+        mock_user_api_key_dict.team_models = None
+        mock_user_api_key_dict.access_group_ids = None
+        mock_user_api_key_dict.team_id = None
+        mock_user_api_key_dict.router_settings = None
+        mock_user_api_key_dict.metadata = {}
+
+        mock_provider_config = MagicMock()
+        mock_provider_config.get_complete_url.return_value = (
+            "https://us-south.ml.cloud.ibm.com/ml/v1/deployments",
+            {},
+        )
+        mock_provider_config.validate_environment.return_value = {"Authorization": "Bearer test-iam-token"}
+
+        mock_router = MagicMock()
+        mock_router.get_model_list.return_value = [
+            {
+                "model_name": "watsonx-chat-a",
+                "litellm_params": {
+                    "model": "watsonx/ibm/granite-13b-chat-v2",
+                    "use_in_pass_through": True,
+                    "api_key": "wx-key-a",
+                    "project_id": "proj-a",
+                    "api_base": "https://us-south.ml.cloud.ibm.com",
+                },
+            },
+            {
+                "model_name": "watsonx-chat-b",
+                "litellm_params": {
+                    "model": "watsonx/ibm/granite-8b-code",
+                    "use_in_pass_through": True,
+                    "api_key": "wx-key-b",
+                    "project_id": "proj-b",
+                    "api_base": "https://us-south.ml.cloud.ibm.com",
+                },
+            },
+        ]
+        mock_endpoint_func = AsyncMock(return_value={"resources": []})
+
+        with (
+            patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.ProviderConfigManager.get_provider_passthrough_config",
+                return_value=mock_provider_config,
+            ),
+            patch("litellm.proxy.proxy_server.llm_router", mock_router),
+            patch(
+                "litellm.proxy.utils.get_available_models_for_user",
+                AsyncMock(return_value=["watsonx-chat-a", "watsonx-chat-b"]),
+            ),
+            patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
+                return_value=mock_endpoint_func,
+            ),
+        ):
+            result = await watsonx_proxy_route(
+                endpoint="ml/v1/deployments",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+            assert result == {"resources": []}
+            mock_provider_config.validate_environment.assert_called_once()
+            call_kwargs = mock_provider_config.validate_environment.call_args[1]
+            assert call_kwargs["api_key"] == "wx-key-b"
+
 
 _WATSONX_ENV = (
     "WATSONX_API_KEY",
@@ -482,7 +667,7 @@ def _iam_response(token: str) -> MagicMock:
 
 
 async def _route_target_and_iam_apikey(
-    monkeypatch, llm_router: litellm.Router, env: dict[str, str]
+    monkeypatch, llm_router: litellm.Router, env: dict[str, str], key_models: list[str] | None = None
 ) -> tuple[str, str, str]:
     from litellm.llms.watsonx.common_utils import iam_token_cache
     from litellm.proxy.pass_through_endpoints.passthrough_endpoint_router import PassthroughEndpointRouter
@@ -497,6 +682,14 @@ async def _route_target_and_iam_apikey(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router",
         PassthroughEndpointRouter(llm_router_getter=lambda: llm_router),
     )
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", llm_router)
+    unrestricted_key = MagicMock(spec=UserAPIKeyAuth)
+    unrestricted_key.models = key_models or []
+    unrestricted_key.team_models = []
+    unrestricted_key.access_group_ids = None
+    unrestricted_key.team_id = None
+    unrestricted_key.router_settings = None
+    unrestricted_key.metadata = {}
     endpoint_func = AsyncMock(return_value={"results": []})
     with (
         patch.object(litellm.module_level_client, "post", return_value=_iam_response("iam-token-1")) as iam_post,
@@ -509,7 +702,7 @@ async def _route_target_and_iam_apikey(
             endpoint="ml/v1/text/generation",
             request=_post_request({"input": "hi", "project_id": "proj"}),
             fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(spec=UserAPIKeyAuth),
+            user_api_key_dict=unrestricted_key,
         )
     route_kwargs = create_route.call_args.kwargs
     return (
@@ -574,6 +767,26 @@ async def test_watsonx_route_falls_back_to_env_when_the_only_flagged_deployment_
         monkeypatch,
         llm_router,
         env={"WX_API_KEY": "wx-env-key", "WATSONX_API_BASE": "https://us-south.ml.cloud.ibm.com"},
+    )
+
+    assert target == "https://us-south.ml.cloud.ibm.com/ml/v1/text/generation"
+    assert authorization == "Bearer iam-token-1"
+    assert iam_apikey == "wx-env-key"
+
+
+@pytest.mark.asyncio
+async def test_watsonx_route_does_not_use_a_flagged_deployment_the_key_is_not_allowed_to_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm_router: Final = litellm.Router(
+        model_list=[_watsonx_deployment("wx-deployment-key", "https://eu-de.ml.cloud.ibm.com", use_in_pass_through=True)]
+    )
+
+    target, authorization, iam_apikey = await _route_target_and_iam_apikey(
+        monkeypatch,
+        llm_router,
+        env={"WX_API_KEY": "wx-env-key", "WATSONX_API_BASE": "https://us-south.ml.cloud.ibm.com"},
+        key_models=["some-other-model"],
     )
 
     assert target == "https://us-south.ml.cloud.ibm.com/ml/v1/text/generation"

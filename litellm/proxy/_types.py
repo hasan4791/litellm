@@ -2230,6 +2230,10 @@ class PassThroughGenericEndpoint(LiteLLMPydanticObjectBase):
         default={},
         description="Key-value pairs of headers to be forwarded with the request. You can set any key value pair here and it will be forwarded to your target endpoint",
     )
+    forward_headers: bool | None = Field(
+        default=None,
+        description="If True, the headers of the incoming request (including Authorization) are forwarded to the target. Headers set in `headers` take precedence over forwarded ones.",
+    )
     default_query_params: dict = Field(
         default={},
         description="Key-value pairs of default query parameters to be sent with every request to this endpoint. These can be overridden by client-provided query parameters. For example: {'key': 'default_value', 'api_version': '2023-01'}",

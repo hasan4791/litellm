@@ -4259,16 +4259,47 @@ async def watsonx_proxy_route(
     if provider_config is None:
         raise HTTPException(status_code=404, detail="Watsonx passthrough config not found")
 
-    watsonx_credentials: Final = passthrough_endpoint_router.get_proxy_wide_deployment_credentials(
-        custom_llm_provider="watsonx"
+    from litellm.proxy.pass_through_endpoints.llm_provider_handlers.watsonx_passthrough_handler import (
+        WatsonxPassthroughHandler,
     )
-    api_key: Final = watsonx_credentials.api_key if watsonx_credentials is not None else None
-    api_base: Final = watsonx_credentials.api_base if watsonx_credentials is not None else None
+
+    request_body: Final = await WatsonxPassthroughHandler.request_body(request)
+    is_streaming_request: Final = bool(request_body.get("stream"))
+
+    requested_model: Final = WatsonxPassthroughHandler.extract_param(
+        request_body=request_body,
+        query_params=request.query_params,
+        name="model_id",
+        alias="model",
+    )
+    requested_project_id: Final = WatsonxPassthroughHandler.extract_param(
+        request_body=request_body,
+        query_params=request.query_params,
+        name="project_id",
+    )
+    requested_space_id: Final = WatsonxPassthroughHandler.extract_param(
+        request_body=request_body,
+        query_params=request.query_params,
+        name="space_id",
+    )
+
+    allowed_deployments: Final = await WatsonxPassthroughHandler.allowed_deployments(
+        user_api_key_dict=user_api_key_dict, requested_model=requested_model
+    )
+    watsonx_router_creds: Final = WatsonxPassthroughHandler.resolve_credentials_from_router_deployments(
+        model_id=requested_model,
+        project_id=requested_project_id,
+        space_id=requested_space_id,
+        deployments=allowed_deployments,
+    )
+    creds: Final = watsonx_router_creds or {}
+    _resolved_api_key: Final = creds.get("api_key")
+    _resolved_api_base: Final = creds.get("api_base")
 
     # Get complete URL with version parameter
     complete_url, _ = provider_config.get_complete_url(
-        api_base=api_base,
-        api_key=api_key,
+        api_base=_resolved_api_base,
+        api_key=_resolved_api_key,
         model="",
         endpoint=endpoint,
         request_query_params=None,
@@ -4282,20 +4313,9 @@ async def watsonx_proxy_route(
         messages=[],
         optional_params={},
         litellm_params={},
-        api_key=api_key,
-        api_base=api_base,
+        api_key=_resolved_api_key,
+        api_base=_resolved_api_base,
     )
-
-    # Check for streaming
-    is_streaming_request = False
-    if request.method == "POST":
-        if "multipart/form-data" not in request.headers.get("content-type", ""):
-            _request_body = await _json_request_body(request)
-        else:
-            _request_body = await get_form_data(request)
-
-        if _request_body.get("stream"):
-            is_streaming_request = True
 
     request_query_params: Final = dict(request.query_params)
     if request_query_params.get("version") is None:
